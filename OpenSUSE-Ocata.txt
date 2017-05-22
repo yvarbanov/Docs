@@ -1,0 +1,1199 @@
+-- Define --
+
+OpenSUSE 42.2 Ocata
+
+3 Node SetUP:
+1x Controller 					// 4RAM 1Cpu 15GB OS
+1x Compute 						// 4RAM 2Cpu 15GB OS
+1x Storage (object & block)		// 1RAM 1Cpu 15GB OS 10GB object1 10GB object2 12GB block
+														sdb				sdc 		sdd
+
+Controller:
+eth0 - bridged
+eth1 - Internal
+Other:
+eth0 - NAT
+eth1 - Internal
+
+NETS:
+bridged > 172.19.10.0/24
+Internal > 10.0.0.0/24
+
+/etc/hosts
+127.0.0.1		localhost
+10.0.0.20       controller.local controller
+10.0.0.30       compute.local compute
+10.0.0.40       storage.local storage
+
+Cloning VM fix NIC names:
+rm  /etc/udev/rules.d/70-persistent-net.rules
+reboot
+
+-- Pre --
+
+1. Chrony
+
+Controller:
+zypper install -y chrony
+vim /etc/chrony.conf
+	pool 2.opensuse.pool.ntp.org iburst
+	allow 10.0.0.0/24
+systemctl enable chronyd.service
+systemctl start chronyd.service
+
+Other:
+zypper install -y chrony
+vim /etc/chrony.conf
+	#pool 2.opensuse.pool.ntp.org iburst
+	server controller iburst
+systemctl enable chronyd.service
+systemctl start chronyd.service
+
+Check Connection:
+chronyc tracking
+chronyc sources
+
+2. OpenStack Packages
+
+All nodes:
+zypper addrepo -f obs://Cloud:OpenStack:Ocata/openSUSE_Leap_42.2 Ocata
+zypper rm patterns-openSUSE-minimal_base-conflicts
+zypper --gpg-auto-import-keys refresh && zypper -n dup
+zypper install -y python-openstackclient
+
+3. MariaDB
+
+Controller:
+zypper install -y mariadb-client mariadb python-PyMySQL
+cat << EOF > /etc/my.cnf.d/openstack.cnf
+[mysqld]
+bind-address = 10.0.0.20
+
+default-storage-engine = innodb
+innodb_file_per_table = on
+max_connections = 4096
+collation-server = utf8_general_ci
+character-set-server = utf8
+EOF
+
+systemctl enable mysql.service
+systemctl start mysql.service
+
+#Don't unset till end of installation
+export ROOT_DB_PASS='20S3cret'
+
+cat << EOF > secure_mysql.sql
+UPDATE mysql.user SET Password=PASSWORD('$ROOT_DB_PASS') WHERE User='root';
+DELETE FROM mysql.user WHERE User='';
+DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+DROP DATABASE IF EXISTS test;
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+FLUSH PRIVILEGES;
+EOF
+
+mysql -sfu root < "secure_mysql.sql"
+rm secure_mysql.sql
+
+4. RabbitMQ
+
+Controller:
+zypper in -y rabbitmq-server
+echo "RABBITMQ_NODENAME=rabbit@localhost" > /etc/rabbitmq/rabbitmq-env.conf
+systemctl enable rabbitmq-server.service
+systemctl start rabbitmq-server.service
+export RABBIT_PASS='20S3cret'
+rabbitmqctl add_user openstack RABBIT_PASS
+rabbitmqctl set_permissions openstack ".*" ".*" ".*"
+unset RABBIT_PASS
+
+5. Memcached
+
+Controller:
+zypper in -y memcached python-python-memcached
+vi /etc/sysconfig/memcached
+	MEMCACHED_PARAMS="-l controller"
+systemctl enable memcached.service
+systemctl start memcached.service
+
+
+-- Keystone --
+
+Controller:
+
+1. Create DB
+
+export KEYSTONE_DBPASS='20S3cret'
+echo "CREATE DATABASE keystone;" > keystone.sql
+echo "GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'localhost' IDENTIFIED BY '$KEYSTONE_DBPASS';" >> keystone.sql
+echo "GRANT ALL PRIVILEGES ON keystone.* TO 'keystone'@'%' IDENTIFIED BY '$KEYSTONE_DBPASS';" >> keystone.sql
+mysql -u root -p"$ROOT_DB_PASS" < keystone.sql
+rm keystone.sql
+
+2. Packages Install
+
+zypper in -y openstack-keystone apache2-mod_wsgi
+vi /etc/keystone/keystone.conf
+	[database]
+	connection = mysql+pymysql://keystone:$KEYSTONE_DBPASS@controller/keystone
+	[token]
+	provider = fernet
+
+unset KEYSTONE_DBPASS
+
+3. Keystone Config
+
+su -s /bin/sh -c "keystone-manage db_sync" keystone
+keystone-manage fernet_setup --keystone-user keystone --keystone-group keystone
+keystone-manage credential_setup --keystone-user keystone --keystone-group keystone
+
+export ADMIN_PASS='openstack'
+keystone-manage bootstrap --bootstrap-password $ADMIN_PASS \
+  --bootstrap-admin-url http://controller:35357/v3/ \
+  --bootstrap-internal-url http://controller:5000/v3/ \
+  --bootstrap-public-url http://controller:5000/v3/ \
+  --bootstrap-region-id RegionOne
+
+cat << EOF > adminrc.sh
+export OS_USERNAME=admin
+export OS_PASSWORD=$ADMIN_PASS
+export OS_PROJECT_NAME=admin
+export OS_USER_DOMAIN_NAME=Default
+export OS_PROJECT_DOMAIN_NAME=Default
+export OS_AUTH_URL=http://controller:35357/v3
+export OS_IDENTITY_API_VERSION=3
+EOF
+unset ADMIN_PASS
+
+4. Apache Config
+
+vi /etc/sysconf/apache2
+	APACHE_SERVERNAME="controller"
+
+cat << EOF > /etc/apache2/conf.d/wsgi-keystone.conf
+Listen 5000
+Listen 35357
+
+<VirtualHost *:5000>
+    WSGIDaemonProcess keystone-public processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
+    WSGIProcessGroup keystone-public
+    WSGIScriptAlias / /usr/bin/keystone-wsgi-public
+    WSGIApplicationGroup %{GLOBAL}
+    WSGIPassAuthorization On
+    ErrorLogFormat "%{cu}t %M"
+    ErrorLog /var/log/apache2/keystone.log
+    CustomLog /var/log/apache2/keystone_access.log combined
+
+    <Directory /usr/bin>
+        Require all granted
+    </Directory>
+</VirtualHost>
+
+<VirtualHost *:35357>
+    WSGIDaemonProcess keystone-admin processes=5 threads=1 user=keystone group=keystone display-name=%{GROUP}
+    WSGIProcessGroup keystone-admin
+    WSGIScriptAlias / /usr/bin/keystone-wsgi-admin
+    WSGIApplicationGroup %{GLOBAL}
+    WSGIPassAuthorization On
+    ErrorLogFormat "%{cu}t %M"
+    ErrorLog /var/log/apache2/keystone.log
+    CustomLog /var/log/apache2/keystone_access.log combined
+
+    <Directory /usr/bin>
+        Require all granted
+    </Directory>
+</VirtualHost>
+EOF
+
+chown -R keystone:keystone /etc/keystone
+systemctl enable apache2.service
+systemctl start apache2.service
+
+-- Glance --
+
+Controller:
+
+1. Create DB
+
+export GLANCE_DBPASS='20S3cret'
+cat << EOF > glance.sql
+CREATE DATABASE glance;
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'localhost' IDENTIFIED BY '$GLANCE_DBPASS';
+GRANT ALL PRIVILEGES ON glance.* TO 'glance'@'%' IDENTIFIED BY '$GLANCE_DBPASS';
+EOF
+mysql -u root -p"$ROOT_DB_PASS" < glance.sql
+rm glance.sql
+unset GLANCE_DBPASS
+
+2. Create OpenStack Service
+
+export GLANCE_PASS='20S3cret'
+source adminrc.sh
+openstack project create --description "Service Tenant" service
+openstack user create --domain default --password "$GLANCE_PASS" glance
+unset GLANCE_PASS
+openstack role add --project service --user glance admin
+openstack service create --name glance --description "OpenStack Image" image
+openstack endpoint create --region RegionOne image public http://controller:9292
+openstack endpoint create --region RegionOne image internal http://controller:9292
+openstack endpoint create --region RegionOne image admin http://controller:9292
+
+3. Packages Install
+
+zypper in -y openstack-glance openstack-glance-api openstack-glance-registry openstack-utils
+
+4. Glance Config
+
+export GLANCE_PASS='20S3cret'
+export GLANCE_DBPASS='20S3cret'
+
+vi /etc/glance/glance-api.conf
+	[database]
+	connection = mysql+pymysql://glance:$GLANCE_DBPASS@controller/glance
+	
+	[keystone_authtoken]
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = glance
+	password = $GLANCE_PASS
+	
+	[paste_deploy]
+	flavor = keystone
+	
+	[glance_store]
+	stores = file,http
+	default_store = file
+	filesystem_store_datadir = /var/lib/glance/images/
+
+vi /etc/glance/glance-registry.conf
+	[database]
+	connection = mysql+pymysql://glance:$GLANCE_DBPASS@controller/glance
+	
+	[keystone_authtoken]
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = glance
+	password = $GLANCE_PASS
+	
+	[paste_deploy]
+	flavor = keystone
+
+unset GLANCE_PASS
+unset GLANCE_DBPASS
+systemctl enable openstack-glance-api.service openstack-glance-registry.service
+systemctl start openstack-glance-api.service openstack-glance-registry.service
+
+source adminrc.sh
+wget http://download.cirros-cloud.net/0.3.5/cirros-0.3.5-x86_64-disk.img
+openstack image create "cirros" \
+  --file cirros-0.3.5-x86_64-disk.img \
+  --disk-format qcow2 --container-format bare \
+  --public
+
+-- Nova --
+
+Controller:
+
+1. Create DB
+
+export NOVA_DBPASS='20S3cret'
+cat << EOF > nova.sql
+CREATE DATABASE nova_api;
+CREATE DATABASE nova;
+CREATE DATABASE nova_cell0;
+GRANT ALL PRIVILEGES ON nova_api.* TO 'nova'@'localhost' IDENTIFIED BY '$NOVA_DBPASS';
+GRANT ALL PRIVILEGES ON nova_api.* TO 'nova'@'%' IDENTIFIED BY '$NOVA_DBPASS';
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'localhost' IDENTIFIED BY '$NOVA_DBPASS';
+GRANT ALL PRIVILEGES ON nova.* TO 'nova'@'%' IDENTIFIED BY '$NOVA_DBPASS';
+GRANT ALL PRIVILEGES ON nova_cell0.* TO 'nova'@'localhost' IDENTIFIED BY '$NOVA_DBPASS';
+GRANT ALL PRIVILEGES ON nova_cell0.* TO 'nova'@'%' IDENTIFIED BY '$NOVA_DBPASS';
+EOF
+mysql -u root -p"$ROOT_DB_PASS" < nova.sql
+rm nova.sql
+unset NOVA_DBPASS
+
+2. Create OpenStack Service
+
+source adminrc.sh
+export NOVA_PASS='20S3cret'
+openstack user create --domain default --password "$NOVA_PASS" nova
+unset NOVA_PASS
+openstack role add --project service --user nova admin
+openstack service create --name nova --description "OpenStack Compute" compute
+openstack endpoint create --region RegionOne compute public http://controller:8774/v2.1
+openstack endpoint create --region RegionOne compute internal http://controller:8774/v2.1
+openstack endpoint create --region RegionOne compute admin http://controller:8774/v2.1
+
+export PLACEMENT_PASS='20S3cret'
+openstack user create --domain default --password "$PLACEMENT_PASS" placement
+unset PLACEMENT_PASS
+openstack role add --project service --user placement admin
+openstack service create --name placement --description "Placement API" placement
+openstack endpoint create --region RegionOne placement public http://controller/placement
+openstack endpoint create --region RegionOne placement internal http://controller/placement
+openstack endpoint create --region RegionOne placement admin http://controller/placement
+
+3. Packages Install
+
+zypper in -y openstack-nova-api openstack-nova-scheduler \
+openstack-nova-conductor openstack-nova-consoleauth \
+openstack-nova-novncproxy openstack-nova-placement-api \
+iptables
+
+4. Nova Config
+
+export RABBIT_PASS='20S3cret'
+export NOVA_PASS='20S3cret'
+export NOVA_DBPASS='20S3cret'
+export PLACEMENT_PASS='20S3cret'
+
+vi /etc/nova/nova.conf
+	[DEFAULT]
+	enabled_apis = osapi_compute,metadata
+	transport_url = rabbit://openstack:$RABBIT_PASS@controller
+	my_ip = 10.0.0.20
+	use_neutron = True
+	firewall_driver = nova.virt.firewall.NoopFirewallDriver
+
+	[api_database]
+	connection = mysql+pymysql://nova:$NOVA_DBPASS@controller/nova_api
+
+	[database]
+	connection = mysql+pymysql://nova:$NOVA_DBPASS@controller/nova
+
+	[api]
+	auth_strategy = keystone
+
+	[keystone_authtoken]
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = nova
+	password = $NOVA_PASS
+
+	[vnc]
+	enabled = true
+	vncserver_listen = $my_ip
+	vncserver_proxyclient_address = $my_ip
+
+	[glance]
+	api_servers = http://controller:9292
+
+	[oslo_concurrency]
+	lock_path = /var/run/nova
+
+	[placement]
+	os_region_name = RegionOne
+	project_domain_name = Default
+	project_name = service
+	auth_type = password
+	user_domain_name = Default
+	auth_url = http://controller:35357/v3
+	username = placement
+	password = $PLACEMENT_PASS
+
+unset RABBIT_PASS
+unset NOVA_PASS
+unset NOVA_DBPASS
+unset PLACEMENT_PASS
+
+su -s /bin/sh -c "nova-manage api_db sync" nova
+su -s /bin/sh -c " nova-manage cell_v2 map_cell0 --database_connection mysql+pymysql://nova:$NOVA_DBPASS@controller/nova_cell0" nova
+su -s /bin/sh -c "nova-manage cell_v2 create_cell --name=cell1 --verbose" nova
+
+mv /etc/apache2/vhosts.d/nova-placement-api.conf.sample /etc/apache2/vhosts.d/nova-placement-api.conf
+systemctl reload apache2.service
+
+systemctl enable openstack-nova-api.service \
+openstack-nova-consoleauth.service openstack-nova-scheduler.service \
+openstack-nova-conductor.service openstack-nova-novncproxy.service
+
+systemctl start openstack-nova-api.service \
+openstack-nova-consoleauth.service openstack-nova-scheduler.service \
+openstack-nova-conductor.service openstack-nova-novncproxy.service
+
+Compute:
+
+1. Packages Install
+
+zypper in -y openstack-nova-compute genisoimage qemu-kvm libvirt
+
+2. Nova Config
+
+export RABBIT_PASS='20S3cret'
+export NOVA_PASS='20S3cret'
+export PLACEMENT_PASS='20S3cret'
+
+vi /etc/nova/nova.conf
+	[DEFAULT]
+	enabled_apis = osapi_compute,metadata
+	compute_driver = libvirt.LibvirtDriver
+	transport_url = rabbit://openstack:$RABBIT_PASS@controller
+	my_ip = 10.0.0.30
+	use_neutron = True
+	firewall_driver = nova.virt.firewall.NoopFirewallDriver
+
+	[api]
+	auth_strategy = keystone
+
+	[keystone_authtoken]
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = nova
+	password = $NOVA_PASS
+
+	[vnc]
+	enabled = True
+	vncserver_listen = 0.0.0.0
+	vncserver_proxyclient_address = $my_ip
+	novncproxy_base_url = http://controller:6080/vnc_auto.html
+
+	[glance]
+	api_servers = http://controller:9292
+
+	[oslo_concurrency]
+	lock_path = /var/run/nova
+
+	[placement]
+	os_region_name = RegionOne
+	project_domain_name = Default
+	project_name = service
+	auth_type = password
+	user_domain_name = Default
+	auth_url = http://controller:35357/v3
+	username = placement
+	password = $PLACEMENT_PASS
+
+unset RABBIT_PASS
+unset NOVA_PASS
+unset PLACEMENT_PASS
+
+modprobe nbd
+echo "nbd" >> /etc/modules-load.d/nbd.conf
+
+egrep -c '(vmx|svm)' /proc/cpuinfo 
+if 0 QEMU else do nothing
+
+vi /etc/nova/nova.conf
+	[libvirt]
+	virt_type = qemu
+
+systemctl enable libvirtd.service openstack-nova-compute.service
+systemctl start libvirtd.service openstack-nova-compute.service
+
+Controller:
+
+#source admin-openrc
+#openstack hypervisor list
+su -s /bin/sh -c "nova-manage cell_v2 discover_hosts --verbose" nova
+#If more Compute hosts re-run discover_hosts or edit nova.conf
+#	[scheduler]
+#	discover_hosts_in_cells_interval = 300
+
+#openstack compute service list
+#openstack catalog list
+#openstack image list
+
+-- Neutron -- 
+
+Controller:
+
+1. Create DB
+
+export NEUTRON_DBPASS='20S3cret'
+cat << EOF > neutron.sql
+CREATE DATABASE neutron;
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'localhost' IDENTIFIED BY '$NEUTRON_DBPASS';
+GRANT ALL PRIVILEGES ON neutron.* TO 'neutron'@'%' IDENTIFIED BY '$NEUTRON_DBPASS';
+EOF
+mysql -u root -p"$ROOT_DB_PASS" < neutron.sql
+rm neutron.sql
+unset NEUTRON_DBPASS
+
+2. Create Service
+
+source adminrc.sh
+export NEUTRON_PASS='20S3cret'
+openstack user create --domain default --password "$NEUTRON_PASS" neutron
+unset NEUTRON_PASS
+openstack role add --project service --user neutron admin
+openstack service create --name neutron --description "OpenStack Networking" network
+openstack endpoint create --region RegionOne network public http://controller:9696
+openstack endpoint create --region RegionOne network internal http://controller:9696
+openstack endpoint create --region RegionOne network admin http://controller:9696
+
+3. Self-service Networks Conf
+
+zypper in -y --no-recommends openstack-neutron \
+openstack-neutron-server openstack-neutron-linuxbridge-agent \
+openstack-neutron-l3-agent openstack-neutron-dhcp-agent \
+openstack-neutron-metadata-agent bridge-utils
+
+export RABBIT_PASS='20S3cret'
+export NEUTRON_DBPASS='20S3cret'
+export NEUTRON_PASS='20S3cret'
+export NOVA_PASS='20S3cret'
+
+vi /etc/neutron/neutron.conf
+	[DEFAULT]
+	core_plugin = ml2
+	service_plugins = router
+	allow_overlapping_ips = true
+	transport_url = rabbit://openstack:$RABBIT_PASS@controller
+	auth_strategy = keystone
+	notify_nova_on_port_status_changes = true
+	notify_nova_on_port_data_changes = true
+
+	[database]
+	connection = mysql+pymysql://neutron:$NEUTRON_DBPASS@controller/neutron
+
+	[keystone_authtoken]
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = neutron
+	password = $NEUTRON_PASS
+
+	[nova]
+	auth_url = http://controller:35357
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	region_name = RegionOne
+	project_name = service
+	username = nova
+	password = $NOVA_PASS
+
+unset RABBIT_PASS
+unset NEUTRON_DBPASS
+unset NEUTRON_PASS
+unset NOVA_PASS
+
+vi /etc/neutron/plugins/ml2/ml2_conf.ini
+	[ml2]
+	type_drivers = flat,vlan,vxlan
+	tenant_network_types = vxlan
+	mechanism_drivers = linuxbridge,l2population
+	extension_drivers = port_security
+
+	[ml2_type_flat]
+	flat_networks = provider
+
+	[ml2_type_vxlan]
+	vni_ranges = 1:1000
+
+	[securitygroup]
+	enable_ipset = true
+
+vi /etc/neutron/plugins/ml2/linuxbridge_agent.ini
+	[linux_bridge]
+	#PROVIDER_INTERFACE_NAME = External NIC ie: eth0
+	physical_interface_mappings = provider:PROVIDER_INTERFACE_NAME
+
+	[vxlan]
+	enable_vxlan = true
+	#OVERLAY_INTERFACE_IP_ADDRESS = Management IP ie: eth1 ip addr
+	local_ip = OVERLAY_INTERFACE_IP_ADDRESS
+	l2_population = true
+
+	[securitygroup]
+	enable_security_group = true
+	firewall_driver = neutron.agent.linux.iptables_firewall.IptablesFirewallDriver
+
+vi /etc/neutron/l3_agent.ini
+	[DEFAULT]
+	interface_driver = linuxbridge
+
+vi /etc/neutron/dhcp_agent.ini
+	[DEFAULT]
+	interface_driver = linuxbridge
+	dhcp_driver = neutron.agent.linux.dhcp.Dnsmasq
+	enable_isolated_metadata = true
+
+4. Metadata Config
+
+export METADATA_SECRET='sup3rs3cr3t'
+export NEUTRON_PASS='20S3cret'
+
+vi /etc/neutron/metadata_agent.ini
+	[DEFAULT]
+	nova_metadata_ip = controller
+	metadata_proxy_shared_secret = $METADATA_SECRET
+
+5. Nova Config
+
+vi /etc/nova/nova.conf
+	[neutron]
+	url = http://controller:9696
+	auth_url = http://controller:35357
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	region_name = RegionOne
+	project_name = service
+	username = neutron
+	password = $NEUTRON_PASS
+	service_metadata_proxy = true
+	metadata_proxy_shared_secret = $METADATA_SECRET
+
+unset METADATA_SECRET
+unset NEUTRON_PASS
+
+6. Restart services
+
+chmod a+r /etc/nova/nova.conf
+systemctl restart openstack-nova-api.service
+
+systemctl enable openstack-neutron.service \
+openstack-neutron-linuxbridge-agent.service \
+openstack-neutron-dhcp-agent.service \
+openstack-neutron-metadata-agent.service
+
+systemctl start openstack-neutron.service \
+openstack-neutron-linuxbridge-agent.service \
+openstack-neutron-dhcp-agent.service \
+openstack-neutron-metadata-agent.service
+
+systemctl enable openstack-neutron-l3-agent.service
+systemctl start openstack-neutron-l3-agent.service
+
+Compute:
+
+1. Pacakges Install
+
+zypper in -y --no-recommends openstack-neutron-linuxbridge-agent bridge-utils
+
+2. Neutron Conf
+
+export RABBIT_PASS='20S3cret'
+export NEUTRON_PASS='20S3cret'
+
+vi /etc/neutron/neutron.conf
+	[DEFAULT]
+	transport_url = rabbit://openstack:$RABBIT_PASS@controller
+	auth_strategy = keystone
+
+	[database]
+	#connection
+
+	[keystone_authtoken]
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = neutron
+	password = $NEUTRON_PASS
+
+unset RABBIT_PASS
+unset NEUTRON_PASS
+
+3. Self-service Network Conf
+
+vi /etc/neutron/plugins/ml2/linuxbridge_agent.ini
+	[linux_bridge]
+	#PROVIDER_INTERFACE_NAME = External NIC ie: eth0
+	physical_interface_mappings = provider:PROVIDER_INTERFACE_NAME
+
+	[securitygroup]
+	enable_security_group = true
+	firewall_driver = neutron.agent.linux.iptables_firewall.IptablesFirewallDriver
+
+	[vxlan]
+	enable_vxlan = true
+	#OVERLAY_INTERFACE_IP_ADDRESS = Management IP ie: eth1 ip addr
+	local_ip = OVERLAY_INTERFACE_IP_ADDRESS
+	l2_population = true
+
+4. Nova Conf
+
+export NEUTRON_PASS='20S3cret'
+
+vi /etc/nova/nova.conf
+	[neutron]
+	url = http://controller:9696
+	auth_url = http://controller:35357
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	region_name = RegionOne
+	project_name = service
+	username = neutron
+	password = $NEUTRON_PASS
+
+5. Restart Services
+
+echo 'NEUTRON_PLUGIN_CONF="/etc/neutron/plugins/ml2/ml2_conf.ini"' >> /etc/sysconfig/neutron
+systemctl restart openstack-nova-compute.service
+systemctl enable openstack-neutron-linuxbridge-agent.service
+systemctl start openstack-neutron-linuxbridge-agent.service
+
+Controller:
+
+source adminrc.sh
+
+openstack extension list --network
+openstack network agent list
+
+-- Horizon -- 
+
+1. Package Install
+
+zypper in -y openstack-dashboard
+
+2. Apache Config
+
+cp /etc/apache2/conf.d/openstack-dashboard.conf.sample \
+/etc/apache2/conf.d/openstack-dashboard.conf
+a2enmod rewrite
+
+3. Django Conf
+
+vi /srv/www/openstack-dashboard/openstack_dashboard/local/local_settings.py
+	OPENSTACK_HOST = "controller"
+	ALLOWED_HOSTS = ['*']
+	SESSION_ENGINE = 'django.contrib.sessions.backends.cache'
+
+	CACHES = {
+	    'default': {
+	         'BACKEND': 'django.core.cache.backends.memcached.MemcachedCache',
+	         'LOCATION': 'controller:11211',
+	    }
+	}
+	OPENSTACK_KEYSTONE_URL = "http://%s:5000/v3" % OPENSTACK_HOST
+	OPENSTACK_KEYSTONE_MULTIDOMAIN_SUPPORT = True
+	OPENSTACK_API_VERSIONS = {
+	    "identity": 3,
+	    "image": 2,
+	    "volume": 2,
+	}
+	OPENSTACK_KEYSTONE_DEFAULT_DOMAIN = "Default"
+	OPENSTACK_KEYSTONE_DEFAULT_ROLE = "user"
+	TIME_ZONE = "TIME_ZONE"
+
+systemctl restart apache2.service memcached.service
+
+-- Cinder --
+
+Controller:
+
+1. Create DB
+
+export CINDER_DBPASS='20S3cret'
+cat << EOF > cinder.sql
+CREATE DATABASE cinder;
+GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'localhost' IDENTIFIED BY '$CINDER_DBPASS';
+GRANT ALL PRIVILEGES ON cinder.* TO 'cinder'@'%' IDENTIFIED BY '$CINDER_DBPASS';
+EOF
+mysql -u root -p"$ROOT_DB_PASS" < cinder.sql
+rm cinder.sql
+unset CINDER_DBPASS
+
+2. Create Services
+
+source adminrc.sh
+export CINDER_PASS='20S3cret'
+openstack user create --domain default --password "$CINDER_PASS" cinder
+unset CINDER_PASS
+openstack role add --project service --user cinder admin
+openstack service create --name cinder --description "OpenStack Block Storage v1" volume
+openstack service create --name cinderv2 --description "OpenStack Block Storage v2" volumev2
+openstack endpoint create --region RegionOne volume public http://controller:8776/v1/%\(tenant_id\)s
+openstack endpoint create --region RegionOne volume internal http://controller:8776/v1/%\(tenant_id\)s
+openstack endpoint create --region RegionOne volume admin http://controller:8776/v1/%\(tenant_id\)s
+openstack endpoint create --region RegionOne volumev2 public http://controller:8776/v2/%\(tenant_id\)s
+openstack endpoint create --region RegionOne volumev2 internal http://controller:8776/v2/%\(tenant_id\)s
+openstack endpoint create --region RegionOne volumev2 admin http://controller:8776/v2/%\(tenant_id\)s
+
+3. Pacakges Install
+
+zypper in -y openstack-cinder-api openstack-cinder-scheduler
+
+4. Cinder Conf
+
+export RABBIT_PASS='20S3cret'
+export CINDER_DBPASS='20S3cret'
+export CINDER_PASS='20S3cret'
+
+vi /etc/cinder/cinder.conf
+	[DEFAULT]
+	transport_url = rabbit://openstack:$RABBIT_PASS@controller
+	auth_strategy = keystone
+	my_ip = 10.0.0.20
+	default_volume_type=lvm
+
+	[database]
+	connection = mysql+pymysql://cinder:$CINDER_DBPASS@controller/cinder
+
+	[keystone_authtoken]
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = cinder
+	password = $CINDER_PASS
+
+	[oslo_concurrency]
+	lock_path = /var/lib/cinder/tmp
+
+unset RABBIT_PASS
+unset CINDER_DBPASS
+unset CINDER_PASS
+
+5. Nova Conf
+
+vi /etc/nova/nova.conf
+	[cinder]
+	os_region_name = RegionOne
+
+6. Restart Services
+
+chmod a+r /etc/cinder/cinder.conf
+systemctl restart openstack-nova-api.service
+systemctl enable openstack-cinder-api.service openstack-cinder-scheduler.service
+systemctl start openstack-cinder-api.service openstack-cinder-scheduler.service
+
+Storage:
+
+1. Prep Install
+
+zypper in -y lvm2 qemu
+
+2. Prep Volume
+
+pvcreate /dev/sdd
+vgcreate cinder-volumes /dev/sdd
+
+3. Restrict Access
+
+vi /etc/lvm/lvm.conf
+	# OS uses lvm: allow sda for system and sdd for block, restrict *
+	filter = [ "a/sda/", a/sdd/", "r/.*/"]
+
+#Restrict access on COMPUTE host as well
+#OS uses lvm: allow sda for system
+vi /etc/lvm/lvm.conf
+	filter = [ "a/sda/", "r/.*/"]
+
+4. Packages Install
+
+zypper in -y openstack-cinder-volume tgt
+
+5. Cinder Conf
+
+export RABBIT_PASS='20S3cret'
+export CINDER_DBPASS='20S3cret'
+export CINDER_PASS='20S3cret'
+
+vi /etc/cinder/cinder.conf
+	[DEFAULT]
+	transport_url = rabbit://openstack:$RABBIT_PASS@controller
+	auth_strategy = keystone
+	my_ip = 10.0.0.40
+	enabled_backends = lvm
+	glance_api_servers = http://controller:9292
+
+	[database]
+	connection = mysql+pymysql://cinder:$CINDER_DBPASS@controller/cinder
+
+	[keystone_authtoken]
+	auth_uri = http://controller:5000
+	auth_url = http://controller:35357
+	memcached_servers = controller:11211
+	auth_type = password
+	project_domain_name = default
+	user_domain_name = default
+	project_name = service
+	username = cinder
+	password = $CINDER_PASS
+
+	[oslo_concurrency]
+	lock_path = /var/lib/cinder/tmp
+
+	[lvm]
+	volume_driver = cinder.volume.drivers.lvm.LVMVolumeDriver
+	volume_group = cinder-volumes
+	iscsi_protocol = iscsi
+	iscsi_helper = tgtadm
+	volume_backend_name=LVM_iSCSI
+
+unset RABBIT_PASS
+unset CINDER_DBPASS
+unset CINDER_PASS
+
+echo "include /var/lib/cinder/volumes/*" > /etc/tgt/conf.d/cinder.conf
+
+6. Restart Services
+
+chmod a+r /etc/cinder/cinder.conf
+systemctl enable openstack-cinder-volume.service tgtd.service
+systemctl start openstack-cinder-volume.service tgtd.service
+
+Controller:
+
+systemctl restart openstack-cinder-api.service openstack-cinder-scheduler.service
+openstack volume type create lvm
+volume type set lvm --property volume_backend_name=LVM_iSCSI
+
+openstack volume service list
+cinder extra-specs-list
+
+-- Swift --
+
+ssh-keygen
+ssh-copy-id root@storage # for ring distribution
+
+Controller:
+
+1. Create Service
+
+export SWIFT_PASS='20S3cret'
+source adminrc.sh
+openstack user create --domain default --password "$SWIFT_PASS" swift
+unset SWIFT_PASS
+openstack role add --project service --user swift admin
+openstack service create --name swift --description "OpenStack Object Storage" object-store
+openstack endpoint create --region RegionOne object-store public http://controller:8080/v1/AUTH_%\(tenant_id\)s
+openstack endpoint create --region RegionOne object-store internal http://controller:8080/v1/AUTH_%\(tenant_id\)s
+openstack endpoint create --region RegionOne object-store admin http://controller:8080/v1
+
+2. Package Install
+
+zypper in -y openstack-swift-proxy python-swiftclient python-keystoneclient python-keystonemiddleware python-xml memcached
+
+3. Swift Conf
+
+export SWIFT_PASS='20S3cret'
+
+openstack-config --set /etc/swift/proxy-server.conf DEFAULT bind_port 8080
+openstack-config --set /etc/swift/proxy-server.conf DEFAULT user swift
+openstack-config --set /etc/swift/proxy-server.conf DEFAULT swift_dir /etc/swift
+
+openstack-config --set /etc/swift/proxy-server.conf pipeline:main pipeline 'catch_errors gatekeeper healthcheck proxy-logging cache container_sync bulk ratelimit authtoken keystoneauth container-quotas account-quotas slo dlo versioned_writes proxy-logging proxy-server'
+
+openstack-config --set /etc/swift/proxy-server.conf app:proxy-server use egg:swift#proxy
+openstack-config --set /etc/swift/proxy-server.conf app:proxy-server account_autocreate True
+
+openstack-config --set /etc/swift/proxy-server.conf filter:keystoneauth use egg:swift#keystoneauth
+openstack-config --set /etc/swift/proxy-server.conf filter:keystoneauth operator_roles admin,_member_
+
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken paste.filter_factory keystonemiddleware.auth_token:filter_factory
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken auth_uri http://controller:5000
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken auth_url http://controller:35357
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken memcached_servers controller:11211
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken auth_type password
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken project_domain_name default
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken user_domain_name default
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken project_name service
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken username swift
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken password $SWIFT_PASS
+openstack-config --set /etc/swift/proxy-server.conf filter:authtoken delay_auth_decision True
+
+openstack-config --set /etc/swift/proxy-server.conf filter:cache use egg:swift#memcache
+openstack-config --set /etc/swift/proxy-server.conf filter:cache memcache_servers controller:11211
+
+unset SWIFT_PASS
+
+Storage:
+
+1. Pre
+
+zypper install -y xfsprogs rsync
+
+mkfs.xfs /dev/sdb
+mkfs.xfs /dev/sdc
+mkdir -p /srv/node/sdb
+mkdir -p /srv/node/sdc
+echo "/dev/sdb /srv/node/sdb xfs noatime,nodiratime,nobarrier,logbufs=8 0 2" >> /etc/fstab
+echo "/dev/sdc /srv/node/sdc xfs noatime,nodiratime,nobarrier,logbufs=8 0 2" >> /etc/fstab
+mount /srv/node/sdb
+mount /srv/node/sdc
+
+cat << EOF > /etc/rsyncd.conf
+uid = swift
+gid = swift
+log file = /var/log/rsyncd.log
+pid file = /var/run/rsyncd.pid
+address = 10.0.0.40
+
+[account]
+max connections = 2
+path = /srv/node/
+read only = False
+lock file = /var/lock/account.lock
+
+[container]
+max connections = 2
+path = /srv/node/
+read only = False
+lock file = /var/lock/container.lock
+
+[object]
+max connections = 2
+path = /srv/node/
+read only = False
+lock file = /var/lock/object.lock
+EOF
+
+systemctl enable rsyncd.service
+systemctl start rsyncd.service
+
+2. Packages Install
+
+zypper in -y openstack-swift-account openstack-swift-container openstack-swift-object python-xml openstack-utils
+
+3. Swift Conf
+
+openstack-config --set /etc/swift/account-server.conf DEFAULT bind_ip 10.0.0.40
+openstack-config --set /etc/swift/account-server.conf DEFAULT bind_port 6202
+openstack-config --set /etc/swift/account-server.conf DEFAULT user swift
+openstack-config --set /etc/swift/account-server.conf DEFAULT swift_dir /etc/swift
+openstack-config --set /etc/swift/account-server.conf DEFAULT devices /srv/node
+openstack-config --set /etc/swift/account-server.conf DEFAULT mount_check True
+
+openstack-config --set /etc/swift/account-server.conf pipeline:main pipeline 'healthcheck recon account-server'
+
+openstack-config --set /etc/swift/account-server.conf filter:recon use egg:swift#recon
+openstack-config --set /etc/swift/account-server.conf filter:recon recon_cache_path /var/cache/swift
+
+openstack-config --set /etc/swift/container-server.conf DEFAULT bind_ip 10.0.0.40
+openstack-config --set /etc/swift/container-server.conf DEFAULT bind_port 6201
+openstack-config --set /etc/swift/container-server.conf DEFAULT user swift
+openstack-config --set /etc/swift/container-server.conf DEFAULT swift_dir /etc/swift
+openstack-config --set /etc/swift/container-server.conf DEFAULT devices /srv/node
+openstack-config --set /etc/swift/container-server.conf DEFAULT mount_check True
+
+openstack-config --set /etc/swift/container-server.conf pipeline:main pipeline 'healthcheck recon container-server'
+
+openstack-config --set /etc/swift/container-server.conf filter:recon use egg:swift#recon
+openstack-config --set /etc/swift/container-server.conf filter:recon recon_cache_path /var/cache/swift
+
+openstack-config --set /etc/swift/object-server.conf DEFAULT bind_ip 10.0.0.40
+openstack-config --set /etc/swift/object-server.conf DEFAULT bind_port 6200
+openstack-config --set /etc/swift/object-server.conf DEFAULT user swift
+openstack-config --set /etc/swift/object-server.conf DEFAULT swift_dir /etc/swift
+openstack-config --set /etc/swift/object-server.conf DEFAULT devices /srv/node
+openstack-config --set /etc/swift/object-server.conf DEFAULT mount_check True
+
+openstack-config --set /etc/swift/object-server.conf pipeline:main pipeline 'healthcheck recon object-server'
+
+openstack-config --set /etc/swift/object-server.conf filter:recon use egg:swift#recon
+openstack-config --set /etc/swift/object-server.conf filter:recon recon_cache_path /var/cache/swift
+
+chown -R swift:swift /srv/node
+
+Controller:
+
+1. Create Accout Ring
+
+# devices = sdb sdc
+# partition power = 5 > 2^5 = 32 partitions per device; 64 total.
+# replica = 2
+# time = 1 > hour minimum time between moving a partition more than once
+##
+# zones = 1
+# regions = 1
+# equial weight 
+
+cd /etc/swift
+swift-ring-builder account.builder create 5 2 1
+
+swift-ring-builder account.builder add --region 1 --zone 1 --ip 10.0.0.40 --port 6202 --device sdb --weight 100
+swift-ring-builder account.builder add --region 1 --zone 1 --ip 10.0.0.40 --port 6202 --device sdc --weight 100
+
+swift-ring-builder account.builder rebalance
+#swift-ring-builder account.builder
+
+2. Create Container Ring
+
+swift-ring-builder container.builder create 5 2 1
+swift-ring-builder container.builder add --region 1 --zone 1 --ip 10.0.0.40 --port 6201 --device sdb --weight 100
+swift-ring-builder container.builder add --region 1 --zone 1 --ip 10.0.0.40 --port 6201 --device sdc --weight 100
+swift-ring-builder container.builder rebalance
+#swift-ring-builder container.builder
+
+3. Create Object Ring
+swift-ring-builder object.builder create 5 2 1
+swift-ring-builder object.builder add --region 1 --zone 1 --ip 10.0.0.40 --port 6200 --device sdb --weight 100
+swift-ring-builder object.builder add --region 1 --zone 1 --ip 10.0.0.40 --port 6200 --device sdc --weight 100
+swift-ring-builder object.builder rebalance
+#swift-ring-builder object.builder
+
+4. Distribute rings
+scp *.ring.gz root@storage:/etc/swift
+cd
+
+5. Swift Hash
+
+openstack-config --set /etc/swift/swift.conf swift-hash swift_hash_path_prefix $(openssl rand -hex 10)
+openstack-config --set /etc/swift/swift.conf swift-hash swift_hash_path_suffix $(openssl rand -hex 10)
+
+openstack-config --set /etc/swift/swift.conf storage-policy:0 name Policy-0
+openstack-config --set /etc/swift/swift.conf storage-policy:0 default yes
+
+#distribute conf file
+scp /etc/swift/swift.conf root@storage:/etc/swift
+chown -R root:swift /etc/swift
+ssh root@storage 'chown -R root:swift /etc/swift'
+
+6. Restart Services
+
+Controller:
+
+systemctl enable openstack-swift-proxy.service memcached.service
+systemctl start openstack-swift-proxy.service memcached.service
+
+Storage:
+
+systemctl enable openstack-swift-account.service openstack-swift-account-auditor.service \
+openstack-swift-account-reaper.service openstack-swift-account-replicator.service
+systemctl start openstack-swift-account.service openstack-swift-account-auditor.service \
+openstack-swift-account-reaper.service openstack-swift-account-replicator.service
+systemctl enable openstack-swift-container.service openstack-swift-container-auditor.service \
+openstack-swift-container-replicator.service openstack-swift-container-updater.service
+systemctl start openstack-swift-container.service openstack-swift-container-auditor.service \
+openstack-swift-container-replicator.service openstack-swift-container-updater.service
+systemctl enable openstack-swift-object.service openstack-swift-object-auditor.service \
+openstack-swift-object-replicator.service openstack-swift-object-updater.service
+systemctl start openstack-swift-object.service openstack-swift-object-auditor.service \
+openstack-swift-object-replicator.service openstack-swift-object-updater.service
+
+
+-- Testing Network Enviroment --
+
+1. Create Provider Network
+
+openstack network create  --share --external --provider-physical-network provider --provider-network-type flat public
+openstack subnet create --network public --allocation-pool start=172.19.10.150,end=172.19.10.160 \
+--dns-nameserver 8.8.8.8 --gateway 172.19.10.1 --subnet-range 172.19.10.0/24 sub_public
+
+openstack network create private
+openstack subnet create --network private --dns-nameserver 8.8.4.4 --gateway 172.16.1.1 \
+--subnet-range 172.16.1.0/24 sub_private

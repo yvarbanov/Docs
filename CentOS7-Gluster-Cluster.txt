@@ -1,0 +1,105 @@
+- SetUp Hosts - 
+
+    1  vi /etc/hostname gluster1.local
+    2  vi /etc/hosts
+			127.0.0.1   localhost localhost.localdomain gluster1 gluster1.local
+			::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+			10.0.0.41   gluster1 gluster1.local
+			10.0.0.42   gluster2 gluster2.local
+			10.0.0.40   centos
+    3  vi /etc/sysconfig/network-scripts/ifcfg-eth1
+    		TYPE=Ethernet
+			BOOTPROTO=static
+			IPADDR=10.0.0.41
+			PREFIX=24
+			NAME=eth1
+			DEVICE=eth1
+			ONBOOT=yes
+	   eth0 = NAT
+    4  reboot if needed
+
+
+- Set Repos and Update -
+
+yum -y install epel-release
+yum -y install yum-priorities
+yum -y update
+
+
+- SetUp GlusterFS on Servers -
+
+yum -y install centos-release-gluster
+yum -y install glusterfs-server
+systemctl enable glusterd.service
+systemctl start glusterd.service
+glusterfsd --version
+yum -y install net-tools
+firewall-cmd --get-active-zones
+firewall-cmd --zone=public --add-port=111/tcp --permanent
+firewall-cmd --zone=public --add-port=24007-24020/tcp --permanent
+firewall-cmd --zone=public --add-port=49150-49160/tcp --permanent
+firewall-cmd --zone=public --permanent --list-ports
+firewall-cmd --reload
+gluster peer probe gluster2
+gluster peer status
+
+
+- Volume management - 
+
+#                     name  type:replicated    tcp     server1           server2      
+gluster volume create vol1 replica 2 transport tcp gluster1:/gfsvols gluster2:/gfsvols force
+gluster volume start vol1
+gluster volume info
+gluster volume status
+
+#Check with netstat, look for established
+netstat -tap | grep glusterfsd
+
+#set access if needed
+gluster volume set vol1 auth.allow 10.0.0.40
+gluster volume set vol1 auth.allow *
+gluster volume set vol1 auth.allow 10.0.0.40,10.0.0.20
+
+#destroy
+gluster volume stop
+gluster volume delete vol1
+
+
+- SetUp Gluster on Client/s -
+
+yum -y install glusterfs-client
+mkdir /mnt/glusterfs
+mount.glusterfs gluster1:/vol /mnt/glusterfs
+mount
+df -h
+
+mount on boot
+	vi /etc/rc.local
+		/usr/sbin/mount.glusterfs gluster1:/vol /mnt/glusterfs
+
+
+- Testing -
+
+client ~ # touch /mnt/glusterfs/test1
+client ~ # touch /mnt/glusterfs/test2
+client ~ # fallocate -l 1G /mnt/glusterfs/bigfile.img
+
+client   ~ # ll /mnt/glusterfs
+gluster1 ~ # ll /gfsvols
+gluster2 ~ # ll /gfsvols
+
+gluster1 ~ # poweroff
+
+- wait - 
+client ~ # touch /mnt/glusterfs/test3
+client ~ # rm /mnt/glusterfs/test1
+client ~ # ll /mnt/glusterfs
+
+gluster2 ~ # ll /gfsvols
+
+boot gluster1
+
+- wait for sync -
+gluster1 ~ # ll /gfsvols
+
+- END -

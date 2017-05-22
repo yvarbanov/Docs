@@ -6,7 +6,7 @@ OpenSUSE 42.2 Ocata
 1x Controller 					// 4RAM 1Cpu 15GB OS
 1x Compute 						// 4RAM 2Cpu 15GB OS
 1x Storage (object & block)		// 1RAM 1Cpu 15GB OS 10GB object1 10GB object2 12GB block
-														sdb				sdc 		sdd
+						sdb				sdc 		sdd
 
 Controller:
 eth0 - bridged

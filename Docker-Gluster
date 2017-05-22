@@ -1,0 +1,55 @@
+Gluster & Gluster-Object with Docker test On Ubuntu 16.04
+
+https://github.com/gluster/gluster-containers
+
+docker pull gluster/gluster-centos
+
+# with persistent storage
+mkdir -p /etc/glusterfs
+mkdir -p /var/lib/glusterd
+mkdir -p /var/log/glusterfs
+
+docker run --name gluster1 -v /etc/glusterfs:/etc/glusterfs:z -v /var/lib/glusterd:/var/lib/glusterd:z -v /var/log/glusterfs:/var/log/glusterfs:z -v /sys/fs/cgroup:/sys/fs/cgroup:ro -d --privileged=true --net bridge -v /dev/:/dev gluster/gluster-centos
+
+# for gluster cluster
+# don't mount volumes for persistent so the uuid can change in /var/lib/glusterd
+# or create multiple dirs for each cluster node
+
+# test run
+docker run --name gluster1 -v /sys/fs/cgroup:/sys/fs/cgroup:ro -d --privileged=true --net bridge -v /dev/:/dev gluster/gluster-centos
+
+docker run --name gluster2 -v /sys/fs/cgroup:/sys/fs/cgroup:ro -d --privileged=true --net bridge -v /dev/:/dev gluster/gluster-centos
+
+docker exec -it gluster1 bash
+	gluster peer probe 172.17.0.3
+	gluster peer status
+	gluster volume create test replica 2 transport tcp 172.17.0.2:/mnt/gluster-volume 172.17.0.3:/mnt/gluster-volume force
+	gluster volume sart test
+	gluster volume status
+
+#on ubunut host test cluster
+sudo apt-get install glusterfs-client
+#make test dir for gluster-swift test later
+sduo mkdir -p /mnt/gluster-object/test
+#mount gluster vol to test dir
+sudo mount -t glusterfs 172.17.0.2:test /mnt/gluster-object/test
+sudo touch /mnt/gluster-object/test/file{1..5}
+#check gluster1 or gluster2
+#[gluster1 ]# ls /mnt/gluster-volume/
+ls /mnt/gluster-object/test/
+#Clean for gluster-swift
+sudo rm -rf /mnt/gluster-object/test/file*
+
+# gluster object 
+
+git clone https://github.com/prashanthpai/docker-gluster-swift.git
+docker build --rm --tag gluster-object:latest .
+docker run --name swift -d -p 8080:8080 -v /mnt/gluster-object:/mnt/gluster-object -e GLUSTER_VOLUMES="test" gluster-object
+#https://github.com/gluster/gluster-swift/blob/master/doc/markdown/quick_start_guide.md#using_swift
+curl -i -X PUT http://localhost:8080/v1/AUTH_test/mycontainer
+echo "Hello World" > mytestfile
+curl -i -X PUT -T mytestfile http://localhost:8080/v1/AUTH_test/mycontainer/mytestfile
+curl -i -X GET -o newfile http://localhost:8080/v1/AUTH_test/mycontainer/mytestfile
+
+
+

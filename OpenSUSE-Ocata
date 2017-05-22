@@ -3,10 +3,10 @@
 OpenSUSE 42.2 Ocata
 
 3 Node SetUP:
-1x Controller 					// 4RAM 1Cpu 15GB OS
-1x Compute 						// 4RAM 2Cpu 15GB OS
+1x Controller 				// 4RAM 1Cpu 15GB OS
+1x Compute 				// 4RAM 2Cpu 15GB OS
 1x Storage (object & block)		// 1RAM 1Cpu 15GB OS 10GB object1 10GB object2 12GB block
-						sdb				sdc 		sdd
+							      sdb	   sdc	        sdd
 
 Controller:
 eth0 - bridged
@@ -20,12 +20,11 @@ bridged > 172.19.10.0/24
 Internal > 10.0.0.0/24
 
 /etc/hosts
-127.0.0.1		localhost
+127.0.0.1	localhost
 10.0.0.20       controller.local controller
 10.0.0.30       compute.local compute
 10.0.0.40       storage.local storage
 
-Cloning VM fix NIC names:
 rm  /etc/udev/rules.d/70-persistent-net.rules
 reboot
 

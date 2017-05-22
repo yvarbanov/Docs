@@ -1,10 +1,10 @@
 Deployment node or Dnode:
-10.0.0.8 -> PythonCase used for Ansible deployment
+10.0.0.8 -> Dev used for Ansible deployment
 
 Target nodes or Tnodes:
-10.0.0.10 -> Controller eth0-NAT eth1-Interna eth2-Libre
-10.0.0.15 -> Compute  eth0-NAT eth1-Interna
-10.0.0.20 -> Storage  eth0-NAT eth1-Interna
+10.0.0.10 -> Controller eth0-NAT eth1-Int eth2-Empty
+10.0.0.15 -> Compute  eth0-NAT eth1-Int
+10.0.0.20 -> Storage  eth0-NAT eth1-Int
 	     vda 20GB OS and swift with loopbacks 
              vdb 10GB cinder
 
@@ -108,13 +108,6 @@ mkdir -p /etc/kolla/config/swift
 Object, Accout, Container Rigns Create.
 
 
-CINDER
-https://docs.openstack.org/developer/kolla/newton/cinder-guide.html
-
-#On Storage node
-pvcreate /dev/vdb
-vgcreate cinder-volumes /dev/vdb
-
 DEPLOY KOLLA:
 
 Dnode:
@@ -132,8 +125,7 @@ vi /etc/kolla/globals
 	enable_heat: "yes"
 	enable_magnum: "yes"
 	enable_swift: "yes"
-        enable_cinder: "yes"
-        enable_cinder_backend_lvm: "yes"
+        enable_cinder: "no"
 	...
 
 vi multinode

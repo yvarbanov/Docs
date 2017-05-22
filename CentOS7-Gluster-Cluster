@@ -15,7 +15,7 @@
 			NAME=eth1
 			DEVICE=eth1
 			ONBOOT=yes
-	   eth0 = NAT
+	eth0 = NAT
     4  reboot if needed
 
 

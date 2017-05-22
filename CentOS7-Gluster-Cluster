@@ -101,5 +101,3 @@ boot gluster1
 
 - wait for sync -
 gluster1 ~ # ll /gfsvols
-
-- END -

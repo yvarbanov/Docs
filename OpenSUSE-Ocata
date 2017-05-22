@@ -1,6 +1,6 @@
 -- Define --
 
-OpenSUSE 42.2 Ocata
+OpenSUSE 42.2 + OpenStack Ocata
 
 3 Node SetUP:
 1x Controller 				// 4RAM 1Cpu 15GB OS

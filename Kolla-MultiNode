@@ -109,6 +109,7 @@ Object, Accout, Container Rigns Create.
 
 CINDER
 https://docs.openstack.org/developer/kolla-ansible/cinder-guide.html
+#map sdb dev/loop3
 pvcreate /dev/loop3
 vgcreate cinder-volumes /dev/loop3
 

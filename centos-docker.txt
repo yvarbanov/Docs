@@ -1,0 +1,91 @@
+cat << EOF > /etc/environment
+LANG=en_US.utf-8
+LC_ALL=en_US.utf-8
+EOF
+
+tee setup.sh <<EOF
+localectl set-locale LANG=en_US.utf8
+yum install -y yum-utils
+yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+yum -y install docker-ce
+systemctl enable docker && systemctl start docker
+EOF
+bash setup.sh
+
+SWARM
+https://github.com/moby/moby/tree/master/experimental
+cat << EOF >> /etc/docker/daemon.json
+{
+    "experimental": true
+}
+EOF
+systemctl restart docker
+systemctl daemon-reload
+
+master #
+
+# cat << EOF > setup.sh 
+# firewall-cmd --zone=public --add-port=2337/tcp --permanent
+# firewall-cmd --zone=public --add-port=7946/tcp --permanent
+# firewall-cmd --zone=public --add-port=7946/udp --permanent
+# firewall-cmd --zone=public --add-port=4789/udp --permanent
+# firewall-cmd --reload
+# EOF
+# bash setup.sh
+systemctl stop firewalld
+
+docker swarm init --advertise-addr $(hostname -i)
+docker node ls
+docker node inspect self
+docker node inspect worker
+#retrieve join command
+docker swarm join-token worker
+
+worker:
+cat << EOF > setup.sh 
+firewall-cmd --zone=public --add-port=2337/tcp --permanent
+firewall-cmd --zone=public --add-port=7946/tcp --permanent
+firewall-cmd --zone=public --add-port=7946/udp --permanent
+firewall-cmd --zone=public --add-port=4789/udp --permanent
+firewall-cmd --reload
+EOF
+bash setup.sh
+docker swarm join \
+    --token SWMTKN-1-62aocpqbsj7mddrbc8vlmrkbi5vb35r0f05quosqt37o0lptf3-83ms3vro5sudis94evr5au4eg \
+    10.0.1.10:2377
+
+master #
+cat << EOF > compose-swarm.yaml
+version: '3'
+
+services:
+
+  mysql:
+    image: mariadb
+    environment:
+      MYSQL_ROOT_PASSWORD: example
+    deploy:
+      replicas: 1
+      placement:
+        constraints: 
+          - node.role == worker
+
+  wordpress:
+    image: wordpress
+    ports:
+      - 8080:80
+    depends_on:
+      - mysql
+    environment:
+      WORDPRESS_DB_PASSWORD: example
+    deploy:
+      replicas: 1
+      placement:
+        constraints: 
+          - node.role == manager
+EOF
+
+docker deploy -c compose-swarm.yaml myapp --detach=false
+docker service ls
+docker service ps myapp
+

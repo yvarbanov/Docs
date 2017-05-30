@@ -173,6 +173,14 @@ POST INSTALL:
 kolla-ansible post-deploy
 . /etc/kolla/admin-openrc.sh
 #pip install python-openstackclient
+#map br-ex with eth2 for external access
+
+##NOTES:
+#you can add custom config. Ex: you want horizon on all interfaces
+mkdir /etc/kolla/config/horizon/
+vi /etc/kolla/config/horizon/horizon.conf
+Listen 80
+...
 
 
 
